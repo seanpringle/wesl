@@ -11,6 +11,7 @@
 #include <sstream>
 #include <deque>
 #include <cassert>
+#include <utility>
 
 template <typename I, typename F, typename S, typename U>
 class WESL {
@@ -1843,17 +1844,20 @@ public:
 	}
 
 	typedef std::function<std::string(const I&)> ISerialize;
-	typedef std::function<void(I&, const std::string&)> IUnserialize;
+	typedef std::function<I(const std::string&)> IUnserialize;
 
 	typedef std::function<std::string(const F&)> FSerialize;
-	typedef std::function<void(F&, const std::string&)> FUnserialize;
+	typedef std::function<F(const std::string&)> FUnserialize;
 
 	typedef std::function<std::string(const S&)> SSerialize;
-	typedef std::function<void(S&, const std::string&)> SUnserialize;
+	typedef std::function<S(const std::string&)> SUnserialize;
 
-	typedef std::function<std::string(const U&)> UserDataSerialize;
-	typedef std::function<void(U&, const std::string&)> UserDataUnserialize;
+	typedef std::function<std::string(const U&)> USerialize;
+	typedef std::function<U(const std::string&)> UUnserialize;
 
+	// Export VM state as text. This is only the runtime stacks and instruction pointer, and not
+	// the byte code and call tables. This can only be unserialized into a fresh VM that has
+	// compiled the same source code.
 	std::string serialize(
 		ISerialize iSerialize,
 		FSerialize fSerialize,
@@ -1863,31 +1867,30 @@ public:
 		using namespace std;
 		ostringstream state;
 
-		auto encode = [&](const string& s) {
-			return s;
-		};
-
 		state << "stack " << stack.size() << endl;
 		for (auto& value: stack) {
-			if (holds_alternative<bool>(value)) ss << "bool " << (get<bool>(value) ? "true": "false") << endl;
-			if (holds_alternative<I>(value)) string s = iSerialize(get<I>(value)); ss << "I " << s.size() << ' ' << s << endl;
-			if (holds_alternative<F>(value)) string s = fSerialize(get<F>(value)); ss << "F " << s.size() << ' ' << s << endl;
-			if (holds_alternative<S>(value)) string s = sSerialize(get<S>(value)); ss << "S " << s.size() << ' ' << s << endl;
-			if (holds_alternative<U>(value)) string s = uSerialize(get<U>(value)); ss << "U " << s.size() << ' ' << s << endl;
-			if (holds_alternative<Span>(value)) ss << "Span " << get<Span>(value).start << ' ' get<Span>(value).width << endl;
+			if (holds_alternative<bool>(value)) state << "bool " << (get<bool>(value) ? "true": "false") << endl;
+			if (holds_alternative<I>(value)) { string s = iSerialize(get<I>(value)); state << "I " << s.size() << ' ' << s << endl; }
+			if (holds_alternative<F>(value)) { string s = fSerialize(get<F>(value)); state << "F " << s.size() << ' ' << s << endl; }
+			if (holds_alternative<S>(value)) { string s = sSerialize(get<S>(value)); state << "S " << s.size() << ' ' << s << endl; }
+			if (holds_alternative<U>(value)) { string s = uSerialize(get<U>(value)); state << "U " << s.size() << ' ' << s << endl; }
+			if (holds_alternative<Span>(value)) state << "Span " << get<Span>(value).start << ' ' << get<Span>(value).width << endl;
 		}
 
 		state << "frames " << frames.size() << endl;
-		for (auto offset: frames) {
-			state << offset << endl;
-		}
+		for (auto offset: frames) state << offset << endl;
 
 		state << "rstack " << rstack.size() << endl;
-		for (auto offset: rstack) {
-			state << offset << endl;
-		}
+		for (auto offset: rstack) state << offset << endl;
+
+		state << "instruction " << instruction << endl;
+
+		return state.str();
 	}
 
+	// Import VM state from text. The VM must have compiled the same source code and
+	// attached the same callback functions that were in place when this text was
+	// serialized.
 	void unserialize(const std::string& s,
 		IUnserialize iUnserialize,
 		FUnserialize fUnserialize,
@@ -1897,27 +1900,58 @@ public:
 		using namespace std;
 		istringstream state(s);
 
-		auto decode = [&](const string& s) {
-			return s;
+		auto expect = [&](const string& word) {
+			string in; state >> in;
+			if (in != word) throw runtime_error("expected keyword " + word);
 		};
 
-		string word;
+		Size depth;
 
-		state >> word;
-		if (word != "stack")
-			throw runtime_error("expected stack");
-
-		Size depth, size;
-		string type;
-		string value;
-
+		expect("stack");
 		state >> depth;
+		stack.resize(depth);
+
 		for (Size i = 0; i < depth; i++) {
+			string type;
 			state >> type;
+
+			Size size;
 			state >> size;
 
-			if (type == "I") {
+			char space;
+			state.read(&space, 1);
+
+			vector<char> buf(size+1, 0);
+			state.read(buf.data(), size);
+			string value(buf.data());
+
+			if (type == "bool") stack[i] = (value == "true");
+			else if (type == "I") stack[i] = iUnserialize(value);
+			else if (type == "F") stack[i] = fUnserialize(value);
+			else if (type == "S") stack[i] = sUnserialize(value);
+			else if (type == "U") stack[i] = uUnserialize(value);
+			else if (type == "Span") {
+				Span span;
+				state >> span.start;
+				state >> span.width;
+				stack[i] = span;
+			}
+			else {
+				throw runtime_error("bad type: " + type);
+			}
 		}
 
+		expect("frames");
+		state >> depth;
+		frames.resize(depth);
+		for (auto& cell: frames) state >> cell;
+
+		expect("rstack");
+		state >> depth;
+		rstack.resize(depth);
+		for (auto& cell: rstack) state >> cell;
+
+		expect("instruction");
+		state >> instruction;
 	}
 };
