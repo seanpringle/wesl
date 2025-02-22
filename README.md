@@ -1,4 +1,4 @@
 # WESL
 
-![WESL](https://github.com/seanpringle/wesl/blob/main/wesl.png?raw=true)
+![WESL](https://github.com/seanpringle/wesl/blob/master/wesl.png?raw=true)
 
