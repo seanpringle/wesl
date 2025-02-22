@@ -96,11 +96,13 @@ public:
 		Size frame = 0;
 	};
 
+	class Session;
+
 	// Internal code calling an external function
 	struct CallOut {
 		Type type;
 		std::vector<Type> args;
-		std::function<Value(WESL&,std::span<Value>)> fn;
+		std::function<Value(Session&,std::span<Value>)> fn;
 	};
 
 private:
@@ -1464,36 +1466,8 @@ private:
 		}
 	}
 
-	// Runtime data stack; frames are contiguous
-	std::vector<Value> stack;
-
-	// Runtime frame "pointers" (offsets into stack vector)
-	std::vector<Size> frames;
-
-	// Return "addresses" (offsets into code vector)
-	std::vector<Size> rstack;
-
-	// A view of the current frame within the data stack
-	std::span<Value> frame() {
-		return {&stack[frames.back()], stack.size()-frames.back()};
-	}
-
-	void push(Value v) {
-		stack.push_back(v);
-	}
-
-	Value pop() {
-		Value v = stack.back();
-		stack.pop_back();
-		return v;
-	}
-
-	Value top() {
-		return stack.back();
-	}
-
 	// For std::visit
-	struct {
+	struct BoolCaster {
 		// Essentially a flag register
 		bool b = false;
 		void operator()(const bool& bb) { b = bb; }
@@ -1502,257 +1476,9 @@ private:
 		void operator()(const S& s) { b = s.size() > 0; }
 		void operator()(const U& s) { b = false; }
 		void operator()(const Span& s) { b = s.width > 0; }
-	} boolCaster;
-
-	// Instruction "pointer" (offset into code vector)
-	Size instruction = 0;
-
-	// Execute the next instruction
-	void next() {
-		using namespace std;
-		auto op = get<Opcode>(code[instruction++]);
-
-		switch (op) {
-			case Opcode::Call: {
-				Function fn = get<Function>(code[instruction++]);
-				rstack.push_back(instruction);
-				instruction = fn.entry;
-				frames.push_back(stack.size() - fn.args);
-				stack.resize(frames.back() + fn.frame, Value(I(0)));
-				break;
-			}
-			case Opcode::Return: {
-				Value v = stack.back();
-				stack.resize(frames.back());
-				frames.pop_back();
-				stack.push_back(v);
-				instruction = rstack.back();
-				rstack.pop_back();
-				break;
-			}
-			case Opcode::Jump: {
-				instruction = get<Size>(code[instruction++]);
-				break;
-			}
-			case Opcode::JZ: {
-				Size to = get<Size>(code[instruction++]);
-				visit(boolCaster,pop());
-				if (!boolCaster.b) instruction = to;
-				break;
-			}
-			case Opcode::CallOut: {
-				CallOut* f = get<CallOut*>(code[instruction++]);
-				Value r = f->fn(*this, span<Value>(stack.begin() + stack.size() - f->args.size(), f->args.size()));
-				stack.resize(stack.size()-f->args.size());
-				push(r);
-				break;
-			}
-			case Opcode::LStore: {
-				Size o = get<Size>(code[instruction++]);
-				frame()[o] = pop();
-				break;
-			}
-			case Opcode::LFetch: {
-				Size o = get<Size>(code[instruction++]);
-				push(frame()[o]);
-				break;
-			}
-			case Opcode::GStore: {
-				Size o = get<Size>(code[instruction++]);
-				stack[o] = pop();
-				break;
-			}
-			case Opcode::GFetch: {
-				Size o = get<Size>(code[instruction++]);
-				push(stack[o]);
-				break;
-			}
-			case Opcode::Print: {
-				Value v = pop();
-				cout << v;
-				break;
-			}
-			case Opcode::ICast: {
-				push(I(get<F>(pop())));
-				break;
-			}
-			case Opcode::FCast: {
-				push(F(get<I>(pop())));
-				break;
-			}
-			case Opcode::BCast: {
-				visit(boolCaster,pop());
-				push(boolCaster.b);
-				break;
-			}
-			case Opcode::AddI: {
-				I b = get<I>(pop());
-				I a = get<I>(pop());
-				push(a+b);
-				break;
-			}
-			case Opcode::AddF: {
-				F b = get<F>(pop());
-				F a = get<F>(pop());
-				push(a+b);
-				break;
-			}
-			case Opcode::AddS: {
-				S b = get<S>(pop());
-				S a = get<S>(pop());
-				push(a+b);
-				break;
-			}
-			case Opcode::SubI: {
-				I b = get<I>(pop());
-				I a = get<I>(pop());
-				push(a-b);
-				break;
-			}
-			case Opcode::SubF: {
-				F b = get<F>(pop());
-				F a = get<F>(pop());
-				push(a-b);
-				break;
-			}
-			case Opcode::MulI: {
-				I b = get<I>(pop());
-				I a = get<I>(pop());
-				push(a*b);
-				break;
-			}
-			case Opcode::MulF: {
-				F b = get<F>(pop());
-				F a = get<F>(pop());
-				push(a*b);
-				break;
-			}
-			case Opcode::DivI: {
-				I b = get<I>(pop());
-				I a = get<I>(pop());
-				push(a/b);
-				break;
-			}
-			case Opcode::DivF: {
-				F b = get<F>(pop());
-				F a = get<F>(pop());
-				push(a/b);
-				break;
-			}
-			case Opcode::ModI: {
-				I b = get<I>(pop());
-				I a = get<I>(pop());
-				push(a%b);
-				break;
-			}
-			case Opcode::Lt: {
-				Value b = pop();
-				Value a = pop();
-				push(a<b);
-				break;
-			}
-			case Opcode::Gt: {
-				Value b = pop();
-				Value a = pop();
-				push(a>b);
-				break;
-			}
-			case Opcode::Lte: {
-				Value b = pop();
-				Value a = pop();
-				push(a<=b);
-				break;
-			}
-			case Opcode::Gte: {
-				Value b = pop();
-				Value a = pop();
-				push(a>=b);
-				break;
-			}
-			case Opcode::Eq: {
-				Value b = pop();
-				Value a = pop();
-				push(a==b);
-				break;
-			}
-			case Opcode::NEq: {
-				Value b = pop();
-				Value a = pop();
-				push(!(a==b));
-				break;
-			}
-			case Opcode::Literal: {
-				auto v = code[instruction++];
-				struct Pusher {
-					WESL& vm;
-					Pusher(WESL& v) : vm{v} {}
-					void operator()(const Opcode& v) { throw; }
-					void operator()(const Size& v) { throw; }
-					void operator()(const bool& v) { vm.push(v); }
-					void operator()(const I& v) { vm.push(v); }
-					void operator()(const S& v) { vm.push(v); }
-					void operator()(const F& v) { vm.push(v); }
-					void operator()(const Function& v) { throw; }
-					void operator()(const CallOut* v) { throw; }
-				} pusher(*this);
-				visit(pusher, v);
-				break;
-			}
-			case Opcode::Drop: {
-				pop();
-				break;
-			}
-			case Opcode::LSpan: {
-				Size off = get<Size>(code[instruction++]);
-				Size len = get<Size>(code[instruction++]);
-				push(Span{frames.back()+off,len});
-				break;
-			}
-			case Opcode::GSpan: {
-				Size off = get<Size>(code[instruction++]);
-				Size len = get<Size>(code[instruction++]);
-				push(Span{off,len});
-				break;
-			}
-			case Opcode::Get: {
-				Size off = max(I(0), get<I>(pop()));
-				Span spn = get<Span>(pop());
-				Value v(I(0));
-				if (spn.width > 0) {
-					off = min(spn.width-1, off);
-					if (spn.start + off < stack.size()) {
-						v = stack[spn.start + off];
-					}
-				}
-				push(v);
-				break;
-			}
-			case Opcode::Set: {
-				Value v = pop();
-				Size off = max(I(0), get<I>(pop()));
-				Span spn = get<Span>(pop());
-				if (spn.width > 0) {
-					off = min(spn.width-1, off);
-					if (spn.start + off < stack.size()) {
-						stack[spn.start + off] = v;
-					}
-				}
-				break;
-			}
-		}
-	}
+	};
 
 public:
-	void reset() {
-		stack.clear();
-		frames.clear();
-		instruction = 0;
-	}
-
-	void clear() {
-		reset();
-		code.clear();
-	}
 
 	struct Result {
 		bool ok = false;
@@ -1760,14 +1486,488 @@ public:
 		Value value;
 	};
 
-	// Register an external callback
-	void callback(std::string_view name, Type type, std::vector<Type> args, std::function<Value(WESL&,std::span<Value>)> fn) {
-		callouts[std::string(name)] = {type,args,fn};
+	class Session {
+	private:
+		const WESL& wesl;
+
+		// Instruction "pointer" (offset into code vector)
+		Size instruction = 0;
+
+		// Runtime data stack; frames are contiguous
+		std::vector<Value> stack;
+
+		// Runtime frame "pointers" (offsets into stack vector)
+		std::vector<Size> frames;
+
+		// Return "addresses" (offsets into code vector)
+		std::vector<Size> rstack;
+
+		void push(Value v) {
+			stack.push_back(v);
+		}
+
+		Value pop() {
+			Value v = stack.back();
+			stack.pop_back();
+			return v;
+		}
+
+		Value top() {
+			return stack.back();
+		}
+
+		// A view of the current frame within the data stack
+		std::span<Value> frame() {
+			return {&stack[frames.back()], stack.size()-frames.back()};
+		}
+
+	public:
+		Session(const WESL& w) : wesl{w} {
+			frames.push_back(0);
+			stack.resize(wesl.globalFrame);
+			while (instruction < Size(wesl.code.size())) next();
+			assert(stack.size() == wesl.globalFrame);
+		}
+
+		void clear() {
+			stack.clear();
+			frames.clear();
+			rstack.clear();
+			instruction = 0;
+		}
+
+		size_t memory() const {
+			return sizeof(instruction) +
+				stack.size() * sizeof(stack.front()) +
+				frames.size() * sizeof(frames.front()) +
+				rstack.size() * sizeof(rstack.front())
+			;
+		}
+
+		// Convert a stack-relative Span{} to an absolute span<Value>
+		std::span<Value> absolute(Span s) {
+			return std::span<Value>(stack.data() + s.start, s.width);
+		}
+
+		// Execute the next instruction
+		void next() {
+			using namespace std;
+			auto op = get<Opcode>(wesl.code[instruction++]);
+
+			switch (op) {
+				case Opcode::Call: {
+					Function fn = get<Function>(wesl.code[instruction++]);
+					rstack.push_back(instruction);
+					instruction = fn.entry;
+					frames.push_back(stack.size() - fn.args);
+					stack.resize(frames.back() + fn.frame, Value(I(0)));
+					break;
+				}
+				case Opcode::Return: {
+					Value v = stack.back();
+					stack.resize(frames.back());
+					frames.pop_back();
+					stack.push_back(v);
+					instruction = rstack.back();
+					rstack.pop_back();
+					break;
+				}
+				case Opcode::Jump: {
+					instruction = get<Size>(wesl.code[instruction++]);
+					break;
+				}
+				case Opcode::JZ: {
+					Size to = get<Size>(wesl.code[instruction++]);
+					BoolCaster caster;
+					visit(caster,pop());
+					if (!caster.b) instruction = to;
+					break;
+				}
+				case Opcode::CallOut: {
+					CallOut* f = get<CallOut*>(wesl.code[instruction++]);
+					Value r = f->fn(*this, span<Value>(stack.begin() + stack.size() - f->args.size(), f->args.size()));
+					stack.resize(stack.size()-f->args.size());
+					push(r);
+					break;
+				}
+				case Opcode::LStore: {
+					Size o = get<Size>(wesl.code[instruction++]);
+					frame()[o] = pop();
+					break;
+				}
+				case Opcode::LFetch: {
+					Size o = get<Size>(wesl.code[instruction++]);
+					push(frame()[o]);
+					break;
+				}
+				case Opcode::GStore: {
+					Size o = get<Size>(wesl.code[instruction++]);
+					stack[o] = pop();
+					break;
+				}
+				case Opcode::GFetch: {
+					Size o = get<Size>(wesl.code[instruction++]);
+					push(stack[o]);
+					break;
+				}
+				case Opcode::Print: {
+					Value v = pop();
+					cout << v;
+					break;
+				}
+				case Opcode::ICast: {
+					push(I(get<F>(pop())));
+					break;
+				}
+				case Opcode::FCast: {
+					push(F(get<I>(pop())));
+					break;
+				}
+				case Opcode::BCast: {
+					BoolCaster caster;
+					visit(caster,pop());
+					push(caster.b);
+					break;
+				}
+				case Opcode::AddI: {
+					I b = get<I>(pop());
+					I a = get<I>(pop());
+					push(a+b);
+					break;
+				}
+				case Opcode::AddF: {
+					F b = get<F>(pop());
+					F a = get<F>(pop());
+					push(a+b);
+					break;
+				}
+				case Opcode::AddS: {
+					S b = get<S>(pop());
+					S a = get<S>(pop());
+					push(a+b);
+					break;
+				}
+				case Opcode::SubI: {
+					I b = get<I>(pop());
+					I a = get<I>(pop());
+					push(a-b);
+					break;
+				}
+				case Opcode::SubF: {
+					F b = get<F>(pop());
+					F a = get<F>(pop());
+					push(a-b);
+					break;
+				}
+				case Opcode::MulI: {
+					I b = get<I>(pop());
+					I a = get<I>(pop());
+					push(a*b);
+					break;
+				}
+				case Opcode::MulF: {
+					F b = get<F>(pop());
+					F a = get<F>(pop());
+					push(a*b);
+					break;
+				}
+				case Opcode::DivI: {
+					I b = get<I>(pop());
+					I a = get<I>(pop());
+					push(a/b);
+					break;
+				}
+				case Opcode::DivF: {
+					F b = get<F>(pop());
+					F a = get<F>(pop());
+					push(a/b);
+					break;
+				}
+				case Opcode::ModI: {
+					I b = get<I>(pop());
+					I a = get<I>(pop());
+					push(a%b);
+					break;
+				}
+				case Opcode::Lt: {
+					Value b = pop();
+					Value a = pop();
+					push(a<b);
+					break;
+				}
+				case Opcode::Gt: {
+					Value b = pop();
+					Value a = pop();
+					push(a>b);
+					break;
+				}
+				case Opcode::Lte: {
+					Value b = pop();
+					Value a = pop();
+					push(a<=b);
+					break;
+				}
+				case Opcode::Gte: {
+					Value b = pop();
+					Value a = pop();
+					push(a>=b);
+					break;
+				}
+				case Opcode::Eq: {
+					Value b = pop();
+					Value a = pop();
+					push(a==b);
+					break;
+				}
+				case Opcode::NEq: {
+					Value b = pop();
+					Value a = pop();
+					push(!(a==b));
+					break;
+				}
+				case Opcode::Literal: {
+					auto v = wesl.code[instruction++];
+					struct Pusher {
+						Session& session;
+						Pusher(Session& s) : session{s} {}
+						void operator()(const Opcode& v) { throw; }
+						void operator()(const Size& v) { throw; }
+						void operator()(const bool& v) { session.push(v); }
+						void operator()(const I& v) { session.push(v); }
+						void operator()(const S& v) { session.push(v); }
+						void operator()(const F& v) { session.push(v); }
+						void operator()(const Function& v) { throw; }
+						void operator()(const CallOut* v) { throw; }
+					} pusher(*this);
+					visit(pusher, v);
+					break;
+				}
+				case Opcode::Drop: {
+					pop();
+					break;
+				}
+				case Opcode::LSpan: {
+					Size off = get<Size>(wesl.code[instruction++]);
+					Size len = get<Size>(wesl.code[instruction++]);
+					push(Span{frames.back()+off,len});
+					break;
+				}
+				case Opcode::GSpan: {
+					Size off = get<Size>(wesl.code[instruction++]);
+					Size len = get<Size>(wesl.code[instruction++]);
+					push(Span{off,len});
+					break;
+				}
+				case Opcode::Get: {
+					Size off = max(I(0), get<I>(pop()));
+					Span spn = get<Span>(pop());
+					Value v(I(0));
+					if (spn.width > 0) {
+						off = min(spn.width-1, off);
+						if (spn.start + off < stack.size()) {
+							v = stack[spn.start + off];
+						}
+					}
+					push(v);
+					break;
+				}
+				case Opcode::Set: {
+					Value v = pop();
+					Size off = max(I(0), get<I>(pop()));
+					Span spn = get<Span>(pop());
+					if (spn.width > 0) {
+						off = min(spn.width-1, off);
+						if (spn.start + off < stack.size()) {
+							stack[spn.start + off] = v;
+						}
+					}
+					break;
+				}
+			}
+		}
+
+		Result execute(std::string_view func, std::span<std::variant<I,F,S,U>> args) {
+			using namespace std;
+			assert(frames.size());
+			assert(stack.size() == wesl.globalFrame);
+
+			try
+			{
+				auto it = wesl.callins.find(string(func));
+				if (it != wesl.callins.end()) {
+					auto& func = it->second;
+
+					auto depth = rstack.size();
+					rstack.push_back(instruction);
+					instruction = func.entry;
+
+					frames.push_back(stack.size());
+					stack.resize(frames.back() + func.frame, Value(I(0)));
+
+					if (args.size() != func.args.size())
+						throw runtime_error("found " + std::to_string(int(args.size())) + " arguments; expected " + std::to_string(int(func.args.size())));
+
+					for (size_t i = 0; i < func.args.size(); i++) {
+						switch (func.args[i]) {
+							case Integer: {
+								stack[i] = get<I>(args[i]);
+								break;
+							}
+							case Float: {
+								stack[i] = get<F>(args[i]);
+								break;
+							}
+							case String: {
+								stack[i] = get<S>(args[i]);
+								break;
+							}
+							case UserData: {
+								stack[i] = get<U>(args[i]);
+								break;
+							}
+							default: {
+								throw runtime_error("unsupported call arg[" + typeName(func.args[i]) + "]");
+							}
+						}
+					}
+
+					while (rstack.size() > depth) next();
+
+					Value ret = stack.back();
+					stack.pop_back();
+
+					assert(stack.size() == wesl.globalFrame);
+					return {true,"",ret};
+				}
+			}
+			catch (exception& e)
+			{
+				return {false,e.what(),Value()};
+			}
+
+			return {false,"unknown function: " + string(func),Value()};
+		}
+
+		typedef std::function<std::string(const I&)> ISerialize;
+		typedef std::function<I(const std::string&)> IUnserialize;
+
+		typedef std::function<std::string(const F&)> FSerialize;
+		typedef std::function<F(const std::string&)> FUnserialize;
+
+		typedef std::function<std::string(const S&)> SSerialize;
+		typedef std::function<S(const std::string&)> SUnserialize;
+
+		typedef std::function<std::string(const U&)> USerialize;
+		typedef std::function<U(const std::string&)> UUnserialize;
+
+		// Export VM state as text. This is only the runtime stacks and instruction pointer, and not
+		// the byte code and call tables. This can only be unserialized into a fresh VM that has
+		// compiled the same source code.
+		std::string serialize(
+			ISerialize iSerialize,
+			FSerialize fSerialize,
+			SSerialize sSerialize,
+			USerialize uSerialize
+		) {
+			using namespace std;
+			ostringstream state;
+
+			state << "stack " << stack.size() << ' ';
+			for (auto& value: stack) {
+				if (holds_alternative<bool>(value)) state << "bool " << (get<bool>(value) ? "true": "false") << ' ';
+				if (holds_alternative<I>(value)) { string s = iSerialize(get<I>(value)); state << "I " << s.size() << ' ' << s << ' '; }
+				if (holds_alternative<F>(value)) { string s = fSerialize(get<F>(value)); state << "F " << s.size() << ' ' << s << ' '; }
+				if (holds_alternative<S>(value)) { string s = sSerialize(get<S>(value)); state << "S " << s.size() << ' ' << s << ' '; }
+				if (holds_alternative<U>(value)) { string s = uSerialize(get<U>(value)); state << "U " << s.size() << ' ' << s << ' '; }
+				if (holds_alternative<Span>(value)) state << "Span " << get<Span>(value).start << ' ' << get<Span>(value).width << ' ';
+			}
+
+			state << "frames " << frames.size() << ' ';
+			for (auto offset: frames) state << offset << ' ';
+
+			state << "rstack " << rstack.size() << ' ';
+			for (auto offset: rstack) state << offset << ' ';
+
+			state << "instruction " << instruction << ' ';
+
+			return state.str();
+		}
+
+		// Import VM state from text. The VM must have compiled the same source code and
+		// attached the same callback functions that were in place when this text was
+		// serialized.
+		void unserialize(const std::string& s,
+			IUnserialize iUnserialize,
+			FUnserialize fUnserialize,
+			SUnserialize sUnserialize,
+			UUnserialize uUnserialize
+		) {
+			using namespace std;
+			istringstream state(s);
+
+			auto expect = [&](const string& word) {
+				string in; state >> in;
+				if (in != word) throw runtime_error("expected keyword " + word);
+			};
+
+			Size depth;
+
+			expect("stack");
+			state >> depth;
+			stack.resize(depth);
+
+			for (Size i = 0; i < depth; i++) {
+				string type;
+				state >> type;
+
+				Size size;
+				state >> size;
+
+				char space;
+				state.read(&space, 1);
+
+				vector<char> buf(size+1, 0);
+				state.read(buf.data(), size);
+				string value(buf.data());
+
+				if (type == "bool") stack[i] = (value == "true");
+				else if (type == "I") stack[i] = iUnserialize(value);
+				else if (type == "F") stack[i] = fUnserialize(value);
+				else if (type == "S") stack[i] = sUnserialize(value);
+				else if (type == "U") stack[i] = uUnserialize(value);
+				else if (type == "Span") {
+					Span span;
+					state >> span.start;
+					state >> span.width;
+					stack[i] = span;
+				}
+				else {
+					throw runtime_error("bad type: " + type);
+				}
+			}
+
+			expect("frames");
+			state >> depth;
+			frames.resize(depth);
+			for (auto& cell: frames) state >> cell;
+
+			expect("rstack");
+			state >> depth;
+			rstack.resize(depth);
+			for (auto& cell: rstack) state >> cell;
+
+			expect("instruction");
+			state >> instruction;
+		}
+	};
+
+	void clear() {
+		code.clear();
 	}
 
-	// Convert a stack-relative Span{} to an absolute span<Value>
-	std::span<Value> absolute(Span s) {
-		return std::span<Value>(stack.data() + s.start, s.width);
+	// Register an external callback
+	void callback(std::string_view name, Type type, std::vector<Type> args, std::function<Value(Session&,std::span<Value>)> fn) {
+		callouts[std::string(name)] = {type,args,fn};
 	}
 
 	Result compile(std::string_view src) {
@@ -1781,177 +1981,7 @@ public:
 		return {true,"",Value()};
 	}
 
-	Result execute(std::string_view func, std::span<std::variant<I,F,S,U>> args) {
-		using namespace std;
-
-		try
-		{
-			if (!frames.size()) {
-				frames.push_back(0);
-				stack.resize(globalFrame, Value(I(0)));
-				instruction = 0;
-				while (instruction < Size(code.size())) next();
-				assert(stack.size() == globalFrame);
-			}
-
-			auto it = callins.find(string(func));
-			if (it != callins.end()) {
-				auto& func = it->second;
-				assert(stack.size() == globalFrame);
-				auto depth = rstack.size();
-				rstack.push_back(instruction);
-				instruction = func.entry;
-				frames.push_back(stack.size());
-				stack.resize(frames.back() + func.frame, Value(I(0)));
-				if (args.size() != func.args.size())
-					throw runtime_error("found " + std::to_string(int(args.size())) + " arguments; expected " + std::to_string(int(func.args.size())));
-				for (size_t i = 0; i < func.args.size(); i++) {
-					switch (func.args[i]) {
-						case Integer: {
-							stack[i] = get<I>(args[i]);
-							break;
-						}
-						case Float: {
-							stack[i] = get<F>(args[i]);
-							break;
-						}
-						case String: {
-							stack[i] = get<S>(args[i]);
-							break;
-						}
-						case UserData: {
-							stack[i] = get<U>(args[i]);
-							break;
-						}
-						default: {
-							throw runtime_error("unsupported call arg[" + typeName(func.args[i]) + "]");
-						}
-					}
-				}
-				while (rstack.size() > depth) next();
-				Value ret = stack.back();
-				stack.pop_back();
-				assert(stack.size() == globalFrame);
-				return {true,"",ret};
-			}
-		}
-		catch (exception& e)
-		{
-			return {false,e.what(),Value()};
-		}
-
-		return {false,"unknown function: " + string(func),Value()};
-	}
-
-	typedef std::function<std::string(const I&)> ISerialize;
-	typedef std::function<I(const std::string&)> IUnserialize;
-
-	typedef std::function<std::string(const F&)> FSerialize;
-	typedef std::function<F(const std::string&)> FUnserialize;
-
-	typedef std::function<std::string(const S&)> SSerialize;
-	typedef std::function<S(const std::string&)> SUnserialize;
-
-	typedef std::function<std::string(const U&)> USerialize;
-	typedef std::function<U(const std::string&)> UUnserialize;
-
-	// Export VM state as text. This is only the runtime stacks and instruction pointer, and not
-	// the byte code and call tables. This can only be unserialized into a fresh VM that has
-	// compiled the same source code.
-	std::string serialize(
-		ISerialize iSerialize,
-		FSerialize fSerialize,
-		SSerialize sSerialize,
-		USerialize uSerialize
-	) {
-		using namespace std;
-		ostringstream state;
-
-		state << "stack " << stack.size() << endl;
-		for (auto& value: stack) {
-			if (holds_alternative<bool>(value)) state << "bool " << (get<bool>(value) ? "true": "false") << endl;
-			if (holds_alternative<I>(value)) { string s = iSerialize(get<I>(value)); state << "I " << s.size() << ' ' << s << endl; }
-			if (holds_alternative<F>(value)) { string s = fSerialize(get<F>(value)); state << "F " << s.size() << ' ' << s << endl; }
-			if (holds_alternative<S>(value)) { string s = sSerialize(get<S>(value)); state << "S " << s.size() << ' ' << s << endl; }
-			if (holds_alternative<U>(value)) { string s = uSerialize(get<U>(value)); state << "U " << s.size() << ' ' << s << endl; }
-			if (holds_alternative<Span>(value)) state << "Span " << get<Span>(value).start << ' ' << get<Span>(value).width << endl;
-		}
-
-		state << "frames " << frames.size() << endl;
-		for (auto offset: frames) state << offset << endl;
-
-		state << "rstack " << rstack.size() << endl;
-		for (auto offset: rstack) state << offset << endl;
-
-		state << "instruction " << instruction << endl;
-
-		return state.str();
-	}
-
-	// Import VM state from text. The VM must have compiled the same source code and
-	// attached the same callback functions that were in place when this text was
-	// serialized.
-	void unserialize(const std::string& s,
-		IUnserialize iUnserialize,
-		FUnserialize fUnserialize,
-		SUnserialize sUnserialize,
-		UUnserialize uUnserialize
-	) {
-		using namespace std;
-		istringstream state(s);
-
-		auto expect = [&](const string& word) {
-			string in; state >> in;
-			if (in != word) throw runtime_error("expected keyword " + word);
-		};
-
-		Size depth;
-
-		expect("stack");
-		state >> depth;
-		stack.resize(depth);
-
-		for (Size i = 0; i < depth; i++) {
-			string type;
-			state >> type;
-
-			Size size;
-			state >> size;
-
-			char space;
-			state.read(&space, 1);
-
-			vector<char> buf(size+1, 0);
-			state.read(buf.data(), size);
-			string value(buf.data());
-
-			if (type == "bool") stack[i] = (value == "true");
-			else if (type == "I") stack[i] = iUnserialize(value);
-			else if (type == "F") stack[i] = fUnserialize(value);
-			else if (type == "S") stack[i] = sUnserialize(value);
-			else if (type == "U") stack[i] = uUnserialize(value);
-			else if (type == "Span") {
-				Span span;
-				state >> span.start;
-				state >> span.width;
-				stack[i] = span;
-			}
-			else {
-				throw runtime_error("bad type: " + type);
-			}
-		}
-
-		expect("frames");
-		state >> depth;
-		frames.resize(depth);
-		for (auto& cell: frames) state >> cell;
-
-		expect("rstack");
-		state >> depth;
-		rstack.resize(depth);
-		for (auto& cell: rstack) state >> cell;
-
-		expect("instruction");
-		state >> instruction;
+	Session session() const {
+		return Session(*this);
 	}
 };
