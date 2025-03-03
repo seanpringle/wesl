@@ -12,6 +12,7 @@
 #include <deque>
 #include <cassert>
 #include <utility>
+#include <span>
 
 template <typename I, typename F, typename S, typename U>
 class WESL {
@@ -105,13 +106,26 @@ public:
 		std::function<Value(Session&,std::span<Value>)> fn;
 	};
 
+	struct Library {
+		std::map<std::string,CallOut> functions;
+
+		void define(std::string_view name, Type type, std::vector<Type> args, std::function<Value(Session&,std::span<Value>)> fn) {
+			functions[std::string(name)] = {type,args,fn};
+		}
+	};
+
+	std::vector<Library*> libs;
+
+	void link(Library& lib) {
+		libs.push_back(&lib);
+	}
+
 private:
 
 	// A persistent stack frame holding globals. Also see globalFunction
 	Size globalFrame = 0;
 
 	std::map<std::string,CallIn> callins;
-	std::map<std::string,CallOut> callouts;
 
 	struct Token {
 		enum {
@@ -245,7 +259,12 @@ private:
 			t.str == "bool" ||
 			t.str == "float" ||
 			t.str == "string" ||
-			t.str == "udata"
+			t.str == "udata" ||
+			t.str == "ints" ||
+			t.str == "bools" ||
+			t.str == "floats" ||
+			t.str == "strings" ||
+			t.str == "udatas"
 		);
 	}
 
@@ -256,6 +275,11 @@ private:
 		if (t.str == "float") return Float;
 		if (t.str == "string") return String;
 		if (t.str == "udata") return UserData;
+		if (t.str == "ints") return toSpanType(Integer);
+		if (t.str == "bools") return toSpanType(Bool);
+		if (t.str == "floats") return toSpanType(Float);
+		if (t.str == "strings") return toSpanType(String);
+		if (t.str == "udatas") return toSpanType(UserData);
 		throw;
 	}
 
@@ -299,6 +323,10 @@ private:
 		return isPunct(t, '=');
 	}
 
+	static bool isColon(const Token& t) {
+		return isPunct(t, ':');
+	}
+
 	static bool isSemiColon(const Token& t) {
 		return isPunct(t, ';');
 	}
@@ -325,6 +353,7 @@ private:
 		Drop,
 		Jump,
 		JZ,
+		JNZ,
 		LStore,
 		LFetch,
 		GStore,
@@ -339,6 +368,9 @@ private:
 		ICast,
 		FCast,
 		BCast,
+		SizeOf,
+		Times,
+		Range,
 	};
 
 	// "byte code"
@@ -349,6 +381,7 @@ private:
 		Type type;
 		Size offset = 0; // into a stack frame
 		Size width = 0; // used by arrays
+		bool spanIndirect = false;
 	};
 
 	struct BlockDefinition {
@@ -370,7 +403,9 @@ private:
 		using namespace std;
 
 		auto tokens = tokeniseSourceCode(src);
+
 		span<const Token> cursor = tokens;
+		if (!cursor.size()) return;
 
 		// Statements and expression boundaries update 'here'
 		auto here = cursor.front();
@@ -511,6 +546,16 @@ private:
 			return peekWord("for");
 		};
 
+		auto peekForRange = [&]() {
+			return cursor.size() > 5
+				&& peekFor()
+				&& isOpeningParen(cursor[1])
+				&& isType(cursor[2])
+				&& isName(cursor[3])
+				&& isColon(cursor[4])
+			;
+		};
+
 		auto peekWhile = [&]() {
 			return peekWord("while");
 		};
@@ -521,6 +566,10 @@ private:
 
 		auto peekBreak = [&]() {
 			return peekWord("break");
+		};
+
+		auto peekSizeOf = [&]() {
+			return peekWord("sizeof");
 		};
 
 		auto peekEnumItem = [&]() {
@@ -541,6 +590,14 @@ private:
 
 		auto peekCast = [&]() {
 			return cursor.size() > 1 && isType(cursor[0]) && isPunct(cursor[1],'(');
+		};
+
+		auto peekAnd = [&]() {
+			return peekWord("and");
+		};
+
+		auto peekOr = [&]() {
+			return peekWord("or");
 		};
 
 		auto peek = [&]() -> Token {
@@ -815,7 +872,7 @@ private:
 			};
 
 			auto compileVariableReference = [&](auto& variable, bool global) {
-				if (variable.type > SpanTypes) {
+				if (variable.type > SpanTypes && !variable.spanIndirect) {
 					code.emplace_back(global ? Opcode::GSpan: Opcode::LSpan);
 					code.emplace_back(variable.offset);
 					code.emplace_back(variable.width);
@@ -918,6 +975,22 @@ private:
 					continue;
 				}
 
+				if (peekSizeOf()) {
+					typeCheck(Integer);
+					take();
+
+					bool parens = isOpeningParen(peek());
+					if (parens) takeOpeningParen();
+					auto type = takeExpression(Any);
+					if (parens) takeClosingParen();
+
+					if (type <= SpanTypes)
+						throw runtime_error(where(here) + ": sizeof() only works on arrays");
+
+					code.emplace_back(Opcode::SizeOf);
+					continue;
+				}
+
 				if (peekCast()) {
 					Type type = takeType();
 					typeCheck(type);
@@ -939,7 +1012,7 @@ private:
 							code.emplace_back(Opcode::BCast);
 							continue;
 						}
-						throw runtime_error(where(here) + ": cannot cast from " + typeName(cast) + " to " + typeName	(type));
+						throw runtime_error(where(here) + ": cannot cast from " + typeName(cast) + " to " + typeName(type));
 					}
 					continue;
 				}
@@ -959,23 +1032,28 @@ private:
 						continue;
 					}
 
-					if (callouts.find(name) != callouts.end()) {
-						auto& func = callouts[name];
+					if ([&]() {
+						for (auto lib: libs) {
+							if (lib->functions.find(name) != lib->functions.end()) {
+								auto& func = lib->functions[name];
 
-						takeOpeningParen();
+								takeOpeningParen();
 
-						for (auto& atype: func.args) {
-							if (isClosingParen(peek()))
-								throw runtime_error(where(here) + ": expected " + std::to_string(func.args.size()) + " arguments");
-							takeExpression(atype);
+								for (auto& atype: func.args) {
+									if (isClosingParen(peek()))
+										throw runtime_error(where(here) + ": expected " + std::to_string(func.args.size()) + " arguments");
+									takeExpression(atype);
+								}
+
+								takeClosingParen();
+								typeCheck(func.type);
+								code.emplace_back(Opcode::CallOut);
+								code.emplace_back(&func);
+								return true;
+							}
 						}
-
-						takeClosingParen();
-						typeCheck(func.type);
-						code.emplace_back(Opcode::CallOut);
-						code.emplace_back(&func);
-						continue;
-					}
+						return false;
+					}()) continue;
 
 					throw runtime_error(where(here) + ": unknown symbol " + name);
 					return Any;
@@ -1007,6 +1085,9 @@ private:
 			variable.name = name;
 			variable.type = type;
 			variable.offset = currentFunc->frame++;
+
+			if (type > SpanTypes)
+				variable.spanIndirect = true;
 
 			if (isAssignment(peek())) {
 				take();
@@ -1160,12 +1241,21 @@ private:
 		auto takePrint = [&]() {
 			take();
 			takeOpeningParen();
+			int i = 0;
 			while (peek() && !isClosingParen(peek()) && !isSemiColon(peek())) {
+				if (i++) {
+					code.emplace_back(Opcode::Literal);
+					code.emplace_back(S(" "));
+					code.emplace_back(Opcode::Print);
+				}
 				takeExpression(Any);
 				code.emplace_back(Opcode::Print);
 			}
 			takeClosingParen();
 			takeSemiColon();
+			code.emplace_back(Opcode::Literal);
+			code.emplace_back(S("\n"));
+			code.emplace_back(Opcode::Print);
 		};
 
 		auto takeReturn = [&]() {
@@ -1203,14 +1293,60 @@ private:
 			takeSemiColon();
 		};
 
+		auto takeCondition = [&]() {
+			vector<Size> jumpPass;
+			vector<Size> jumpFail;
+
+			takeExpression(Any);
+
+			auto branch = [&](Opcode op, auto& vec) {
+				code.emplace_back(op);
+				vec.push_back(code.size());
+				code.emplace_back(Size(0));
+			};
+
+			if (peekAnd()) {
+				while (peekAnd()) {
+					take();
+					branch(Opcode::JZ, jumpFail);
+					takeExpression(Any);
+				}
+				branch(Opcode::JZ, jumpFail);
+
+				if (peekOr())
+					throw runtime_error(where(here) + ": mixed and/or chain");
+			}
+			else
+			if (peekOr()) {
+				while (peekOr()) {
+					take();
+					branch(Opcode::JNZ, jumpPass);
+					takeExpression(Any);
+				}
+				branch(Opcode::JZ, jumpFail);
+
+				if (peekAnd())
+					throw runtime_error(where(here) + ": mixed and/or chain");
+			}
+			else {
+				branch(Opcode::JZ, jumpFail);
+			}
+
+			return array<vector<Size>,2>{jumpPass, jumpFail};
+		};
+
 		auto takeIf = [&]() {
 			take();
 			takeOpeningParen();
-			takeExpression(Any);
-			code.emplace_back(Opcode::JZ);
-			Size ifJump = code.size();
-			code.emplace_back(Size(0));
+
+			auto [jumpPass,jumpFail] = takeCondition();
+
 			takeClosingParen();
+
+			for (auto jump: jumpPass) {
+				code[jump] = Size(code.size());
+			}
+
 			takeBlock();
 
 			if (peekElse()) {
@@ -1218,54 +1354,88 @@ private:
 				code.emplace_back(Opcode::Jump);
 				Size elseJump = code.size();
 				code.emplace_back(Size(0));
-				code[ifJump] = Size(code.size());
+				for (auto jump: jumpFail) {
+					code[jump] = Size(code.size());
+				}
 				if (peekIf()) takeStatement(); else takeBlock();
 				code[elseJump] = Size(code.size());
 			}
 			else {
-				code[ifJump] = Size(code.size());
+				for (auto jump: jumpFail) {
+					code[jump] = Size(code.size());
+				}
 			}
 		};
 
-		auto takeFor = [&]() {
+		auto takeForRange = [&]() {
 			take();
 			beginBlock();
 
 			takeOpeningParen();
-			takeStatement();
 
-			code.emplace_back(Opcode::Jump);
-			Size start = code.size();
-			code.emplace_back();
+			Type type = takeType();
+			string name(take().str);
 
-			Size begin = code.size();
-				auto condition = cursor;
-				takeExpression(Any);
-				takeSemiColon();
-				auto advance = cursor;
-				takeStatement();
-				takeClosingParen();
-				auto body = cursor;
-			code.resize(begin);
+			if (currentBlock().variables.find(name) != currentBlock().variables.end())
+				throw runtime_error(where(here) + ": duplicate name in scope: " + name);
 
-			cursor = advance;
-			takeStatement();
+			auto& variable = currentBlock().variables[name];
+			variable.name = name;
+			variable.type = type;
+			variable.offset = currentFunc->frame++;
 
-			code[start] = Size(code.size());
+			if (variable.type > SpanTypes)
+				throw runtime_error(where(here) + ": expected range of scalars");
 
-			cursor = condition;
-			takeExpression(Any);
-			code.emplace_back(Opcode::JZ);
-			Size done = code.size();
-			code.emplace_back();
+			take(); // colon
 
-			cursor = body;
-			takeBlock();
-			code.emplace_back(Opcode::Jump);
-			code.emplace_back(Size(begin));
-			code[done] = Size(code.size());
+			Type rtype = takeExpression(Any); // range on stack
 
-			endBlock(begin, code.size());
+			takeClosingParen();
+
+			if (type == Integer && rtype == Integer) {
+				// range is limit N
+				code.emplace_back(Opcode::Literal);
+				code.emplace_back(I(-1)); // index, 0:N-1
+				Size begin = code.size();
+
+				code.emplace_back(Opcode::Times);
+				code.emplace_back(variable.offset);
+				Size done = code.size();
+				code.emplace_back();
+
+				takeBlock();
+
+				code.emplace_back(Opcode::Jump);
+				code.emplace_back(Size(begin));
+				code[done] = Size(code.size());
+
+				endBlock(begin, code.size());
+				code.emplace_back(Opcode::Drop); // index
+				code.emplace_back(Opcode::Drop); // limit
+				return;
+			}
+
+			if (rtype > SpanTypes && fromSpanType(rtype) == type) {
+				Size begin = code.size();
+
+				code.emplace_back(Opcode::Range);
+				code.emplace_back(variable.offset);
+				Size done = code.size();
+				code.emplace_back();
+
+				takeBlock();
+
+				code.emplace_back(Opcode::Jump);
+				code.emplace_back(Size(begin));
+				code[done] = Size(code.size());
+
+				endBlock(begin, code.size());
+				code.emplace_back(Opcode::Drop); // range
+				return;
+			}
+
+			throw runtime_error(where(here) + ": expected range of type " + typeName(type));
 		};
 
 		auto takeWhile = [&]() {
@@ -1274,15 +1444,23 @@ private:
 
 			Size begin = code.size();
 			takeOpeningParen();
-			takeExpression(Any);
+
+			auto [jumpPass,jumpFail] = takeCondition();
+
 			takeClosingParen();
-			code.emplace_back(Opcode::JZ);
-			Size done = code.size();
-			code.emplace_back();
+
+			for (auto jump: jumpPass) {
+				code[jump] = Size(code.size());
+			}
+
 			takeBlock();
+
 			code.emplace_back(Opcode::Jump);
 			code.emplace_back(begin);
-			code[done] = Size(code.size());
+
+			for (auto jump: jumpFail) {
+				code[jump] = Size(code.size());
+			}
 
 			endBlock(begin, code.size());
 		};
@@ -1357,8 +1535,8 @@ private:
 				return;
 			}
 
-			if (peekFor()) {
-				takeFor();
+			if (peekForRange()) {
+				takeForRange();
 				return;
 			}
 
@@ -1411,7 +1589,6 @@ private:
 			takeOpeningParen();
 			while (peek() && isType(peek())) {
 				currentFunc->args.push_back(takeType());
-				currentFunc->frame++;
 				if (peekName()) {
 					string name(take().str);
 					auto& variable = currentBlock().variables[name];
@@ -1481,26 +1658,26 @@ private:
 public:
 
 	struct Result {
-		bool ok = false;
+		bool ok = true;
 		std::string error;
 		Value value;
+
+		explicit operator bool() const { return ok; }
+		operator std::string() const { return error; }
 	};
 
 	class Session {
 	private:
-		const WESL& wesl;
+		const WESL* wesl = nullptr;
 
-		// Instruction "pointer" (offset into code vector)
-		Size instruction = 0;
-
-		// Runtime data stack; frames are contiguous
 		std::vector<Value> stack;
 
-		// Runtime frame "pointers" (offsets into stack vector)
-		std::vector<Size> frames;
+		struct Frame {
+			Size ip = 0; // instruction pointer, offset into code vector
+			Size base = 0; // frame base pointer, offset into stack vector
+		};
 
-		// Return "addresses" (offsets into code vector)
-		std::vector<Size> rstack;
+		std::vector<Frame> frames;
 
 		void push(Value v) {
 			stack.push_back(v);
@@ -1516,97 +1693,152 @@ public:
 			return stack.back();
 		}
 
+		Frame& frame() {
+			return frames.back();
+		}
+
 		// A view of the current frame within the data stack
-		std::span<Value> frame() {
-			return {&stack[frames.back()], stack.size()-frames.back()};
+		std::span<Value> locals() {
+			return {&stack[frame().base], stack.size()-frame().base};
 		}
 
 	public:
-		Session(const WESL& w) : wesl{w} {
-			frames.push_back(0);
-			stack.resize(wesl.globalFrame);
-			while (instruction < Size(wesl.code.size())) next();
-			assert(stack.size() == wesl.globalFrame);
+
+		struct Buffer {
+		private:
+			Session& session;
+			Size depth;
+		public:
+			Buffer(Session& s)
+				: session{s}, depth{Size(session.stack.size())}
+			{}
+
+			void push(Value v) {
+				session.push(v);
+			}
+
+			Span span() const {
+				return Span{depth, Size(session.stack.size())-depth};
+			}
+
+			operator Span() const {
+				return span();
+			}
+		};
+
+		Buffer buffer() {
+			return Buffer(*this);
 		}
 
 		void clear() {
-			stack.clear();
+			wesl = nullptr;
 			frames.clear();
-			rstack.clear();
-			instruction = 0;
+			stack.clear();
+		}
+
+		void shrink_to_fit() {
+			frames.shrink_to_fit();
+			stack.shrink_to_fit();
+		}
+
+		void reset() {
+			frames.clear();
+			stack.clear();
+			frames.emplace_back();
+			stack.resize(wesl->globalFrame);
+			while (frame().ip < Size(wesl->code.size())) next();
+			assert(frames.size() == 1);
+			assert(stack.size() == wesl->globalFrame);
+		}
+
+		Session() = default;
+
+		Session(const WESL& w) : wesl{&w} {
+			reset();
 		}
 
 		size_t memory() const {
-			return sizeof(instruction) +
+			return sizeof(wesl) +
 				stack.size() * sizeof(stack.front()) +
-				frames.size() * sizeof(frames.front()) +
-				rstack.size() * sizeof(rstack.front())
+				frames.size() * sizeof(frames.front())
 			;
 		}
 
-		// Convert a stack-relative Span{} to an absolute span<Value>
-		std::span<Value> absolute(Span s) {
-			return std::span<Value>(stack.data() + s.start, s.width);
+		// Extend the current frame (alloca)
+		std::span<Value> buffer(Size cells, Value zero, Span& val) {
+			val = Span{Size(stack.size()), cells};
+			stack.resize(stack.size()+cells, zero);
+			return std::span<Value>(stack.data() + val.start, val.width);
 		}
 
+	private:
 		// Execute the next instruction
 		void next() {
 			using namespace std;
-			auto op = get<Opcode>(wesl.code[instruction++]);
+			auto op = get<Opcode>(wesl->code[frame().ip++]);
 
 			switch (op) {
 				case Opcode::Call: {
-					Function fn = get<Function>(wesl.code[instruction++]);
-					rstack.push_back(instruction);
-					instruction = fn.entry;
-					frames.push_back(stack.size() - fn.args);
-					stack.resize(frames.back() + fn.frame, Value(I(0)));
+					Function fn = get<Function>(wesl->code[frame().ip++]);
+					frames.emplace_back();
+					frame().ip = fn.entry;
+					frame().base = stack.size();
+					stack.resize(stack.size() + fn.frame);
 					break;
 				}
 				case Opcode::Return: {
 					Value v = stack.back();
-					stack.resize(frames.back());
+					stack.resize(frame().base);
 					frames.pop_back();
 					stack.push_back(v);
-					instruction = rstack.back();
-					rstack.pop_back();
 					break;
 				}
 				case Opcode::Jump: {
-					instruction = get<Size>(wesl.code[instruction++]);
+					frame().ip = get<Size>(wesl->code[frame().ip++]);
 					break;
 				}
 				case Opcode::JZ: {
-					Size to = get<Size>(wesl.code[instruction++]);
+					Size to = get<Size>(wesl->code[frame().ip++]);
 					BoolCaster caster;
 					visit(caster,pop());
-					if (!caster.b) instruction = to;
+					if (!caster.b) frame().ip = to;
+					break;
+				}
+				case Opcode::JNZ: {
+					Size to = get<Size>(wesl->code[frame().ip++]);
+					BoolCaster caster;
+					visit(caster,pop());
+					if (caster.b) frame().ip = to;
 					break;
 				}
 				case Opcode::CallOut: {
-					CallOut* f = get<CallOut*>(wesl.code[instruction++]);
-					Value r = f->fn(*this, span<Value>(stack.begin() + stack.size() - f->args.size(), f->args.size()));
+					CallOut* f = get<CallOut*>(wesl->code[frame().ip++]);
+					std::array<Value,8> args;
+					assert(f->args.size() <= 8);
+					for (Size i = 0; i < f->args.size(); i++) {
+						args[i] = stack[stack.size()-f->args.size()+i];
+					}
 					stack.resize(stack.size()-f->args.size());
-					push(r);
+					push(f->fn(*this,args));
 					break;
 				}
 				case Opcode::LStore: {
-					Size o = get<Size>(wesl.code[instruction++]);
-					frame()[o] = pop();
+					Size o = get<Size>(wesl->code[frame().ip++]);
+					locals()[o] = pop();
 					break;
 				}
 				case Opcode::LFetch: {
-					Size o = get<Size>(wesl.code[instruction++]);
-					push(frame()[o]);
+					Size o = get<Size>(wesl->code[frame().ip++]);
+					push(locals()[o]);
 					break;
 				}
 				case Opcode::GStore: {
-					Size o = get<Size>(wesl.code[instruction++]);
+					Size o = get<Size>(wesl->code[frame().ip++]);
 					stack[o] = pop();
 					break;
 				}
 				case Opcode::GFetch: {
-					Size o = get<Size>(wesl.code[instruction++]);
+					Size o = get<Size>(wesl->code[frame().ip++]);
 					push(stack[o]);
 					break;
 				}
@@ -1726,7 +1958,7 @@ public:
 					break;
 				}
 				case Opcode::Literal: {
-					auto v = wesl.code[instruction++];
+					auto v = wesl->code[frame().ip++];
 					struct Pusher {
 						Session& session;
 						Pusher(Session& s) : session{s} {}
@@ -1747,14 +1979,14 @@ public:
 					break;
 				}
 				case Opcode::LSpan: {
-					Size off = get<Size>(wesl.code[instruction++]);
-					Size len = get<Size>(wesl.code[instruction++]);
-					push(Span{frames.back()+off,len});
+					Size off = get<Size>(wesl->code[frame().ip++]);
+					Size len = get<Size>(wesl->code[frame().ip++]);
+					push(Span{frame().base+off,len});
 					break;
 				}
 				case Opcode::GSpan: {
-					Size off = get<Size>(wesl.code[instruction++]);
-					Size len = get<Size>(wesl.code[instruction++]);
+					Size off = get<Size>(wesl->code[frame().ip++]);
+					Size len = get<Size>(wesl->code[frame().ip++]);
 					push(Span{off,len});
 					break;
 				}
@@ -1783,69 +2015,130 @@ public:
 					}
 					break;
 				}
+				case Opcode::SizeOf: {
+					Span spn = get<Span>(pop());
+					push(spn.width);
+					break;
+				}
+				case Opcode::Times: {
+					Size loc = get<Size>(wesl->code[frame().ip++]);
+					Size done = get<Size>(wesl->code[frame().ip++]);
+					I index = get<I>(pop());
+					I limit = get<I>(top());
+					push(++index);
+					if (index == limit) {
+						frame().ip = done;
+						break;
+					}
+					locals()[loc] = index;
+					break;
+				}
+				case Opcode::Range: {
+					Size loc = get<Size>(wesl->code[frame().ip++]);
+					Size done = get<Size>(wesl->code[frame().ip++]);
+					Span spn = get<Span>(pop());
+					if (spn.width == 0) {
+						push(spn); // balance stack
+						frame().ip = done;
+						break;
+					}
+					push(Span{spn.start+1,spn.width-1});
+					locals()[loc] = stack[spn.start];
+					break;
+				}
 			}
 		}
 
-		Result execute(std::string_view func, std::span<std::variant<I,F,S,U>> args) {
-			using namespace std;
-			assert(frames.size());
-			assert(stack.size() == wesl.globalFrame);
+	public:
 
-			try
-			{
-				auto it = wesl.callins.find(string(func));
-				if (it != wesl.callins.end()) {
-					auto& func = it->second;
+		bool running() const {
+			return frames.size() > 1;
+		}
 
-					auto depth = rstack.size();
-					rstack.push_back(instruction);
-					instruction = func.entry;
+		Result enter(const std::string& name, std::span<Value> args) {
+			Result result;
 
-					frames.push_back(stack.size());
-					stack.resize(frames.back() + func.frame, Value(I(0)));
+			if (running()) {
+				result.ok = false;
+				result.error = "session already running";
+				return result;
+			}
 
-					if (args.size() != func.args.size())
-						throw runtime_error("found " + std::to_string(int(args.size())) + " arguments; expected " + std::to_string(int(func.args.size())));
+			assert(frames.size() == 1);
+			assert(stack.size() == wesl->globalFrame);
 
-					for (size_t i = 0; i < func.args.size(); i++) {
-						switch (func.args[i]) {
-							case Integer: {
-								stack[i] = get<I>(args[i]);
-								break;
-							}
-							case Float: {
-								stack[i] = get<F>(args[i]);
-								break;
-							}
-							case String: {
-								stack[i] = get<S>(args[i]);
-								break;
-							}
-							case UserData: {
-								stack[i] = get<U>(args[i]);
-								break;
-							}
-							default: {
-								throw runtime_error("unsupported call arg[" + typeName(func.args[i]) + "]");
-							}
-						}
-					}
+			auto it = wesl->callins.find(name);
 
-					while (rstack.size() > depth) next();
+			if (it == wesl->callins.end()) {
+				result.ok = false;
+				result.error = "function " + name + " unknown";
+				return result;
+			}
 
-					Value ret = stack.back();
-					stack.pop_back();
+			auto& func = it->second;
 
-					assert(stack.size() == wesl.globalFrame);
-					return {true,"",ret};
+			if (args.size() != func.args.size()) {
+				result.ok = false;
+				result.error = "function " + name + " requires " + std::to_string(int(func.args.size())) + " arguments";
+				return result;
+			}
+
+			frames.emplace_back();
+			frame().ip = func.entry;
+			frame().base = stack.size();
+			stack.insert(stack.end(), args.begin(), args.end());
+			stack.resize(stack.size() + func.frame - args.size());
+
+			assert(running());
+
+			return result;
+		}
+
+		Result advance() {
+			Result result;
+			if (running()) {
+				try {
+					next();
+				}
+				catch(std::exception& e) {
+					result = {false,e.what(),Value()};
 				}
 			}
-			catch (exception& e)
-			{
-				return {false,e.what(),Value()};
+			else {
+				result = {false,"not running",Value()};
+			}
+			return result;
+		}
+
+		void halt() {
+			while (running()) {
+				stack.resize(frames.back().base);
+				frames.pop_back();
+			}
+		}
+
+		Result call(const std::string& name, std::span<Value> args, int maxops = 0) {
+			Result result = enter(name, args);
+
+			for (int i = 0; running() && result.ok && (maxops == 0 || i < maxops); i++) {
+				result = advance();
 			}
 
-			return {false,"unknown function: " + string(func),Value()};
+			if (!running() && result.ok) {
+				result.value = stack.back();
+				stack.pop_back();
+			}
+
+			if (running() && result.ok) {
+				result = {false,"exceeded operations",Value()};
+			}
+
+			halt();
+
+			assert(frames.size() == 1);
+			assert(stack.size() == wesl->globalFrame);
+
+			return result;
 		}
 
 		typedef std::function<std::string(const I&)> ISerialize;
@@ -1883,12 +2176,7 @@ public:
 			}
 
 			state << "frames " << frames.size() << ' ';
-			for (auto offset: frames) state << offset << ' ';
-
-			state << "rstack " << rstack.size() << ' ';
-			for (auto offset: rstack) state << offset << ' ';
-
-			state << "instruction " << instruction << ' ';
+			for (auto& frame: frames) state << frame.ip << ' ' << frame.base << ' ';
 
 			return state.str();
 		}
@@ -1949,25 +2237,15 @@ public:
 			expect("frames");
 			state >> depth;
 			frames.resize(depth);
-			for (auto& cell: frames) state >> cell;
-
-			expect("rstack");
-			state >> depth;
-			rstack.resize(depth);
-			for (auto& cell: rstack) state >> cell;
-
-			expect("instruction");
-			state >> instruction;
+			for (auto& frame: frames) {
+				state >> frame.ip;
+				state >> frame.base;
+			}
 		}
 	};
 
 	void clear() {
 		code.clear();
-	}
-
-	// Register an external callback
-	void callback(std::string_view name, Type type, std::vector<Type> args, std::function<Value(Session&,std::span<Value>)> fn) {
-		callouts[std::string(name)] = {type,args,fn};
 	}
 
 	Result compile(std::string_view src) {
